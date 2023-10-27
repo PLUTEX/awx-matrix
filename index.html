@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="shortcut icon" href="/static/media/favicon.ico">
+<title>Ansible AWX | Job result matrix</title>
+<style type="text/css">
+html {
+    font-family: sans-serif;
+    font-size: 10pt;
+    background-color: #f2f2f2;
+}
+td {
+    height: 1.5em;
+}
+.ok {
+    background-color: #080;
+}
+.changed {
+    background-color: #F0AD4E;
+}
+.failed {
+    background-color: #F00;
+}
+.skipped {
+    background-color: #0AA;
+}
+.unknown {
+    background-color: #DDD;
+}
+#filter .states label {
+    border-radius: 2px;
+    margin-right: 1ex;
+    padding: 2px;
+    cursor: pointer;
+}
+
+#target td > a > div {
+    width: 100%;
+}
+#target td > a > div:first-child {
+    border-top-left-radius: 2px;
+    border-top-right-radius: 2px;
+}
+#target td > a > div:last-child {
+    border-bottom-left-radius: 2px;
+    border-bottom-right-radius: 2px;
+}
+#target th {
+    font-weight: normal;
+    text-align: left;
+}
+
+#target thead th:first-child {
+    text-align: right;
+    vertical-align: bottom;
+    cursor: pointer;
+}
+
+/* Collapsible row groups */
+#target tr.rowGroupCaption th {
+    background-color: #DDD;
+    cursor: pointer;
+}
+#target tbody.hidden tr:not(.rowGroupCaption) {
+    display: none;
+}
+#target th[colspan]::before {
+    content: "— ";
+}
+#target tbody.hidden tr.rowGroupCaption th::before {
+    content: "+ ";
+}
+
+#target tbody tr:not(.rowGroupCaption) th {
+    padding-left: 1em;
+}
+
+/* rotated column headers */
+#target thead th {
+    height: 200px;
+    width: 10pt;
+    white-space: nowrap;
+    text-align: left;
+}
+#target thead th > div {
+    transform: translate(0.75em, 89px) rotate(-45deg);
+    width: 1.5em;
+}
+#target thead th > div > span {
+    border-bottom: 1px solid #ccc;
+}
+
+/* Abbreviate task names */
+#target table > tbody th, #target table > tr th {
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    overflow: hidden;
+    max-width: 200px;
+    text-align: left;
+    height: 10pt;
+}
+
+#loader {
+    margin: 0 auto;
+    width: 200px;
+    position: relative;
+    text-align: center;
+    border: 1px solid #000;
+    border-radius: 5px;
+    overflow: hidden;
+}
+
+#loader > div {
+    position: absolute;
+    z-index: -1;
+    height: 1.5em;
+    background-color: #ccc;
+}
+</style>
+</head>
+<body>
+<table id="filter">
+    <thead>
+        <tr>
+            <th>Hide …</th>
+            <th>…with only these states:</th>
+        </tr>
+    <tbody>
+        <tr>
+            <th>Hosts</th>
+            <td class="states" id="hide_host_states"></td>
+        </tr>
+        <tr>
+            <th>Tasks</th>
+            <td class="states" id="hide_task_states"></td>
+        </tr>
+    </tbody>
+</table>
+<div id="loader">
+    <div></div>
+    <span></span>
+</div>
+<div id="target">
+</div>
+<template id="targetTemplate">
+    <table>
+        <thead>
+            <tr>
+                <th onclick="mirrored = !mirrored; paint();">⮶</th>
+            </tr>
+        </thead>
+    </table>
+</template>
+<script>
+const ROLE_SEP = ' : ';
+const results = Object.freeze({
+    unknown: 0,
+    failed: 1,
+    changed: 2,
+    ok: 3,
+    skipped: 4
+})
+const events = [
+    'runner_on_failed',
+    'runner_on_ok',
+    'runner_on_error',
+    'runner_on_skipped',
+    'runner_on_unreachable',
+    'runner_item_on_ok',
+    'runner_item_on_failed',
+    'runner_item_on_skipped',
+];
+
+var host_names = [];
+var task_names = [];
+var result_matrix = [];
+var debug_matrix = [];
+var loaded_count = 0;
+var mirrored = false;
+
+
+function populate_filters() {
+    document.querySelectorAll('#filter .states').forEach((elem) => {
+        Object.keys(results).forEach((result) => {
+            const opt = document.createElement('label')
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.value = results[result];
+            input.addEventListener('input', paint);
+            opt.append(input);
+            opt.className = result;
+            opt.append(result);
+            elem.append(opt);
+        });
+    });
+}
+
+function find_or_add(arr, needle) {
+    const idx = arr.indexOf(needle);
+    if (idx == -1) {
+        arr.push(needle);
+        return arr.length - 1;
+    } else {
+        return idx;
+    }
+}
+
+function get_job_event_result(job_event) {
+    if (job_event.event == 'runner_on_skipped' || job_event.event == 'runner_item_on_skipped')
+        return results.skipped;
+    else if (job_event.failed)
+        return results.failed;
+    else if (job_event.changed)
+        return results.changed;
+    else
+        return results.ok;
+}
+
+function update_loader(added, total) {
+    const max_repaints = 100;
+    const old_progress = Math.floor(loaded_count / total * max_repaints);
+    loaded_count += added;
+    const new_progress = Math.floor(loaded_count / total * max_repaints);
+    const loader = document.getElementById('loader');
+    loader.style.display = '';
+    loader.querySelector('span').textContent = total == '?'? 'Loading' : (`${loaded_count} / ${total}`);
+    loader.querySelector('div').style.width = total == '?'? '0' : `${loaded_count / total * 100}%`;
+
+    // limit amount of repaints
+    if (old_progress != new_progress)
+        paint();
+}
+
+function errored(msg) {
+    const span = document.querySelector('#loader span');
+    span.append(`ERROR: ${msg}`);
+    const link = document.createElement('a');
+    link.addEventListener('click', () => { load_url(this.responseURL); });
+    link.append('Retry');
+    span.append(link);
+}
+
+function loaded() {
+    const results = this.response.results;
+    if (!results && this.response.detail) {
+        errored(this.response.detail);
+        return;
+    }
+    results.forEach((job_event) => {
+        const host_idx = find_or_add(
+            host_names,
+            job_event.event_data.host,
+        );
+        const task_idx = find_or_add(
+            task_names,
+            // job_event.role seems to be a bit random: https://github.com/ansible/ansible-runner/issues/587
+            //(job_event.event_data.role? job_event.role + ROLE_SEP : '') + job_event.task,
+            job_event.task,
+        );
+        if (!result_matrix[task_idx])
+            result_matrix[task_idx] = [];
+
+        const result = get_job_event_result(job_event);
+        if (!result_matrix[task_idx][host_idx])
+            result_matrix[task_idx][host_idx] = [];
+
+        const result_matrix_entry = result_matrix[task_idx][host_idx];
+        result_matrix_entry[result] = (result_matrix_entry[result] || 0) + 1;
+
+        if (!debug_matrix[task_idx])
+            debug_matrix[task_idx] = [];
+        if (!debug_matrix[task_idx][host_idx])
+            debug_matrix[task_idx][host_idx] = [];
+        debug_matrix[task_idx][host_idx].push(job_event);
+    });
+    update_loader(results.length, this.response.count);
+    if (this.response.next) {
+        load_url(this.response.next);
+    } else {
+        document.getElementById('loader').style.display = 'none';
+    }
+}
+
+function make_result_cell(entry) {
+    const cell = document.createElement('a');
+    if (entry) {
+        const sum = entry.reduce((a, b) => a + b, 0)
+        cell.title = `Total: ${sum}`;
+        for (var result in results) {
+            const result_count = entry[results[result]];
+            if (result_count > 0) {
+                const result_div = document.createElement('div');
+                result_div.className = result;
+                result_div.style.height = `${result_count / sum * 100}%`;
+                cell.title += `\n${result}: ${result_count}`;
+                cell.append(result_div);
+            }
+        }
+    } else {
+        const result_div = document.createElement('div');
+        result_div.className = 'unknown';
+        result_div.style.height = '100%';
+        cell.append(result_div);
+    }
+    return cell;
+}
+
+function toggle_tbody_hidden() {
+    this.parentNode.parentNode.classList.toggle('hidden');
+}
+
+function is_result_entry_filtered(entry, filter) {
+    if (entry === undefined)
+        return filter.includes(results.unknown);
+
+    var sum = 0;
+    for(var result in results)
+        if (!filter.includes(results[result]))
+            sum += entry[results[result]] || 0;
+
+    return sum == 0;
+}
+
+function is_task_filtered(_, task_idx) {
+    const filter = [...document.querySelectorAll('#hide_task_states input')]
+        .filter(option => option.checked).map(option => Number(option.value));
+
+    for (var host_idx = 0; host_idx < host_names.length; host_idx++) {
+        if (!is_result_entry_filtered(result_matrix[task_idx][host_idx], filter))
+            return true;
+    }
+    return false;
+}
+
+function is_host_filtered(_, host_idx) {
+    const filter = [...document.querySelectorAll('#hide_host_states input')]
+        .filter(option => option.checked).map(option => Number(option.value));
+
+    for (var task_idx = 0; task_idx < task_names.length; task_idx++) {
+        if (!is_result_entry_filtered(result_matrix[task_idx][host_idx], filter))
+            return true;
+    }
+    return false;
+}
+
+function paint() {
+    const rows = mirrored? host_names : task_names;
+    const rows_filter = rows.map(mirrored? is_host_filtered : is_task_filtered);
+    const cols = mirrored? task_names : host_names;
+    const cols_filter = cols.map(mirrored? is_task_filtered : is_host_filtered);
+
+    const template = document.getElementById('targetTemplate');
+    const table = template.content.cloneNode(true).querySelector('table');
+    const header_row = table.querySelector('thead > tr');
+    cols.forEach((name, idx) => {
+        if (!cols_filter[idx])
+            return;
+        const header_cell = document.createElement('th');
+        const header_div = document.createElement('div');
+        header_cell.append(header_div);
+        const header_span = document.createElement('span');
+        header_div.append(header_span);
+        header_span.append(name);
+        header_row.append(header_cell);
+    });
+
+    var last_role = '';
+    var tbody = document.createElement('tbody');
+    table.append(tbody);
+
+    for (var row = 0; row < rows.length; row++) {
+        if (!rows_filter[row])
+            continue;
+        var rowhead, role;
+        if (!mirrored && rows[row].includes(ROLE_SEP)) {
+            const split = rows[row].split(ROLE_SEP, 2);
+            role = split[0];
+            rowhead = split[1];
+        } else {
+            role = '';
+            rowhead = rows[row];
+        }
+        if (role != last_role) {
+            tbody = document.createElement('tbody');
+            table.append(tbody);
+            const role_heading_row = document.createElement('tr');
+            role_heading_row.className = 'rowGroupCaption';
+            tbody.append(role_heading_row);
+            const role_heading_cell = document.createElement('th');
+            role_heading_cell.addEventListener('click', toggle_tbody_hidden);
+            role_heading_cell.colSpan = cols.length + 1 - cols_filter.filter((x) => x).length;
+            role_heading_cell.append(role);
+            role_heading_row.append(role_heading_cell);
+            last_role = role;
+        }
+
+        const tr = document.createElement('tr');
+        const th = document.createElement('th');
+        th.title = rowhead;
+        th.append(rowhead);
+        tr.append(th);
+        for (var col = 0; col < cols.length; col++) {
+            if (!cols_filter[col])
+                continue;
+
+            const task_idx = mirrored? col : row;
+            const host_idx = mirrored? row : col;
+            const task_name = task_names[task_idx];
+            const host_name = host_names[host_idx];
+            const cell = make_result_cell(result_matrix[task_idx][host_idx]);
+            const job_id = window.location.hash.substr(1);
+
+            cell.title = `Host: ${host_name}\nTask: ${task_name}\n${cell.title}`;
+            cell.href = `/api/v2/jobs/${job_id}/job_events/?host_name=${encodeURIComponent(host_name)}&task=${encodeURIComponent(task_name)}`;
+
+            const td = document.createElement('td');
+            td.append(cell);
+            tr.append(td);
+        }
+        tbody.append(tr);
+    }
+
+    document.getElementById('target').replaceChildren(table);
+}
+
+function load_url(url) {
+    const req = new XMLHttpRequest();
+    req.addEventListener('load', loaded);
+    req.addEventListener('error', errored);
+    req.open('GET', url);
+    req.responseType = 'json';
+    req.send()
+}
+
+function load(job_id) {
+    loaded_count = 0;
+    update_loader(0, '?');
+    load_url(`/api/v2/jobs/${job_id}/job_events/?page_size=200&event__in=${events.join()}`);
+}
+
+load(window.location.hash.substr(1));
+populate_filters();
+</script>
+</body>
+</html>
